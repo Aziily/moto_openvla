@@ -384,6 +384,6 @@ class TrainingStrategy(ABC):
                     if terminate:
                         return
 
-                # Update Progress Bar
+                # Update Progress Bar (status already contains loss, L1 loss, and accuracy information)
                 progress.update()
                 progress.set_description(status)

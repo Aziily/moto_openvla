@@ -8,6 +8,7 @@ format to OpenVLA, IterableDataset shim.
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Tuple, Type
+import sys
 
 import numpy as np
 import torch
@@ -19,9 +20,18 @@ from prismatic.models.backbones.llm.prompting import PromptBuilder
 from prismatic.models.backbones.vision import ImageTransform
 from prismatic.util.data_utils import tree_map
 from prismatic.vla.action_tokenizer import ActionTokenizer
+from prismatic.vla.motion_tokenizer import MotionTokenizer
 from prismatic.vla.datasets.rlds import make_interleaved_dataset, make_single_dataset
 from prismatic.vla.datasets.rlds.oxe import OXE_NAMED_MIXTURES, get_oxe_dataset_kwargs_and_weights
 from prismatic.vla.datasets.rlds.utils.data_utils import NormalizationType
+
+# Make sure the project root (containing the ``latent_motion_tokenizer`` package)
+# is on ``sys.path`` so that we can import from it.
+project_root = Path(__file__).resolve().parents[3]
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+from latent_motion_tokenizer.src.processors.preprocessor_utils import get_rgb_preprocessor
 
 # HuggingFace Default / LLaMa-2 IGNORE_INDEX (for labels)
 IGNORE_INDEX = -100
@@ -29,23 +39,62 @@ IGNORE_INDEX = -100
 
 @dataclass
 class RLDSBatchTransform:
-    action_tokenizer: ActionTokenizer
-    base_tokenizer: PreTrainedTokenizerBase
-    image_transform: ImageTransform
-    prompt_builder_fn: Type[PromptBuilder]
+    action_tokenizer: ActionTokenizer = None
+    motion_tokenizer: MotionTokenizer = None
+    base_tokenizer: PreTrainedTokenizerBase = None
+    image_transform: ImageTransform = None
+    prompt_builder_fn: Type[PromptBuilder] = None
     predict_stop_token: bool = True
+    use_motion_token: bool = False
+    future_observation_k: int = 3  # k steps into the future for motion token extraction
+    window_size: int = 1  # window_size used in chunk_act_obs, needed to locate current frame
+    motion_preprocessor: Any = get_rgb_preprocessor("dinov2")
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
-        dataset_name, action = rlds_batch["dataset_name"], rlds_batch["action"][0]
-        img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
+        dataset_name = rlds_batch["dataset_name"]
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
+        
+        # Get current frame
+        img_primary = rlds_batch["observation"]["image_primary"]
+        
+        # Handle chunked observations: image_primary shape is (window_size + future_observation_window_size, H, W, C)
+        # The frames are arranged as: [t-(window_size-1), ..., t-1, t, t+1, ..., t+future_observation_window_size]
+        # Current frame t is at index = window_size - 1 (the last frame in the "past+current" window)
+        # Future frame t+k is at index = window_size - 1 + k
+        assert img_primary.shape[0] == self.window_size+self.future_observation_k, f"img_primary shape must be ({self.window_size}+{self.future_observation_k}={self.window_size+self.future_observation_k}, H, W, C), but got {img_primary.shape}"
+        # print(f"img_primary shape: {img_primary.shape}")
+        img_curr = Image.fromarray(img_primary[self.window_size - 1])
+        img_next = Image.fromarray(img_primary[self.window_size - 1 + self.future_observation_k])
+        
+        # Transform images and extract tokens
+        if self.use_motion_token and self.motion_tokenizer is not None:
+            # Transform images
+            pixel_values_curr = self.image_transform(img_curr)
+            # pixel_values_next = self.image_transform(img_next)
+            motion_pixel_values_curr = self.motion_preprocessor(img_curr)
+            motion_pixel_values_next = self.motion_preprocessor(img_next)
+            # print(f"pixel_values_curr shape: {pixel_values_curr.shape}")
+            # print(f"motion_pixel_values_curr shape: {motion_pixel_values_curr.shape}")
+            # print(f"motion_pixel_values_next shape: {motion_pixel_values_next.shape}")
+            
+            # Extract motion tokens
+            motion_tokens_str = self.motion_tokenizer(motion_pixel_values_curr, motion_pixel_values_next)
+            output_tokens = motion_tokens_str
+            # print(f"motion_tokens_str: {motion_tokens_str}")
+            num_output_tokens = self.motion_tokenizer.motion_query_num
+        else:
+            # Use action tokenizer (original behavior)
+            action = rlds_batch["action"][0]
+            output_tokens = self.action_tokenizer(action)
+            num_output_tokens = len(action)
+            pixel_values_curr = self.image_transform(img_curr)
 
-        # Construct Chat-based Prompt =>> Input is default query + language instruction, output are the action tokens
+        # Construct Chat-based Prompt =>> Input is default query + language instruction, output are the tokens
         prompt_builder = self.prompt_builder_fn("openvla")
         conversation = [
-            {"from": "human", "value": f"What action should the robot take to {lang}?"},
-            {"from": "gpt", "value": self.action_tokenizer(action)},
+            {"from": "human", "value": f"What {'motion' if self.use_motion_token else 'action'} should the robot take to {lang}?"},
+            {"from": "gpt", "value": output_tokens},
         ]
         for turn in conversation:
             prompt_builder.add_turn(turn["from"], turn["value"])
@@ -57,10 +106,11 @@ class RLDSBatchTransform:
         # Tensorize =>> Run Image Transform to get `pixel_values` =>> Return
         #   =>> IMPORTANT :: IF WE'RE USING HF LLM.forward(..., labels=labels), SHIFTING HAPPENS _INSIDE_ MODEL!
         input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
-        pixel_values = self.image_transform(img)
+        pixel_values = pixel_values_curr
 
-        # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!
-        labels[: -(len(action) + 1)] = IGNORE_INDEX
+        # [CRITICAL] We do not want to take the loss for anything but the predicted tokens!
+        # Count the number of tokens in the output (motion tokens or action tokens)
+        labels[: -(num_output_tokens + 1)] = IGNORE_INDEX
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
 
@@ -77,6 +127,7 @@ class RLDSDataset(IterableDataset):
         shuffle_buffer_size: int = 256_000,
         train: bool = True,
         image_aug: bool = False,
+        future_observation_k: int = 3,  # k steps into the future for motion token extraction
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
@@ -98,10 +149,20 @@ class RLDSDataset(IterableDataset):
             load_language=True,
             action_proprio_normalization_type=NormalizationType.BOUNDS_Q99,
         )
+        # Check if we need to load future frames for motion tokenizer
+        use_motion_token = hasattr(self.batch_transform, 'use_motion_token') and self.batch_transform.use_motion_token
+        window_size = 1  # Keep window_size=1 to only load current frame (past frames not needed for motion tokens)
+        future_observation_window_size = future_observation_k if use_motion_token else 0
+        
+        # Update batch_transform with window_size and future_observation_k
+        self.batch_transform.window_size = window_size
+        self.batch_transform.future_observation_k = future_observation_k
+        
         rlds_config = dict(
             traj_transform_kwargs=dict(
-                window_size=1,                                      # If we wanted to feed / predict more than one step
+                window_size=window_size,                            # Load current frame (and past if window_size > 1)
                 future_action_window_size=0,                        # For action chunking
+                future_observation_window_size=future_observation_window_size,  # Load future frames for motion tokens
                 skip_unlabeled=True,                                # Skip trajectories without language labels
                 goal_relabeling_strategy="uniform",                 # Goals are currently unused
             ),

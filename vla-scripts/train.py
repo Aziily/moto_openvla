@@ -29,6 +29,7 @@ import yaml
 
 from prismatic.conf import VLAConfig, VLARegistry
 from prismatic.models import load, load_vla
+from prismatic.models.vlas import OpenVLA
 from prismatic.overwatch import initialize_overwatch
 from prismatic.training import VLAMetrics, get_train_strategy
 from prismatic.util import set_global_seed
@@ -79,6 +80,11 @@ class TrainConfig:
     trackers: Tuple[str, ...] = ("jsonl", "wandb")                  # Trackers to initialize (if W&B, add config!)
     wandb_project: str = "openvla"                                  # Name of W&B project to log to (use default!)
     wandb_entity: str = "stanford-voltron"                          # Name of entity to log under
+
+    # Motion Tokenizer Parameters
+    use_motion_token: bool = False                                 # Whether to use motion tokenizer instead of action tokenizer
+    latent_motion_tokenizer_path: Optional[Path] = None            # Path to latent motion tokenizer checkpoint directory
+    future_observation_k: int = 3                                  # k steps into the future for motion token extraction (default: 3)
 
     def __post_init__(self) -> None:
         """Lift optimization parameters from `self.vla` for ease of use =>> validate on `expected_world_size`"""
@@ -188,7 +194,7 @@ def train(cfg: TrainConfig) -> None:
 
     # Get VLA Dataset & Collator
     overwatch.info(f"Creating VLA Open-X Dataset with Mixture `{cfg.vla.data_mix}`")
-    vla_dataset, action_tokenizer, collator = get_vla_dataset_and_collator(
+    vla_dataset, action_tokenizer, motion_tokenizer, collator = get_vla_dataset_and_collator(
         cfg.data_root_dir,
         cfg.vla.data_mix,
         image_transform=vlm.vision_backbone.get_image_transform(),
@@ -197,7 +203,19 @@ def train(cfg: TrainConfig) -> None:
         default_image_resolution=vlm.vision_backbone.default_image_resolution,
         shuffle_buffer_size=cfg.vla.shuffle_buffer_size,
         image_aug=cfg.image_aug,
+        use_motion_token=cfg.use_motion_token,
+        latent_motion_tokenizer_path=str(cfg.latent_motion_tokenizer_path) if cfg.latent_motion_tokenizer_path is not None else None,
+        future_observation_k=cfg.future_observation_k if cfg.use_motion_token else 0,
     )
+    
+    # Update VLA model with motion tokenizer if using motion tokens
+    if cfg.use_motion_token and motion_tokenizer is not None:
+        overwatch.info("Updating VLA model with motion tokenizer")
+        vlm.motion_tokenizer = motion_tokenizer
+        vlm.use_motion_token = True
+        if isinstance(vlm, OpenVLA):
+            # Ensure the model is properly configured
+            assert vlm.motion_tokenizer is not None, "Motion tokenizer must be set when use_motion_token=True"
 
     # Save dataset statistics for de-normalization at inference time
     if overwatch.is_rank_zero():
@@ -241,10 +259,12 @@ def train(cfg: TrainConfig) -> None:
 
     # Run VLA Training
     overwatch.info("Starting VLA Training Loop")
+    # When using motion tokenizer, action_tokenizer is None, but we still need to pass it for compatibility
+    # The training strategy will need to be updated to handle motion tokenizer separately
     train_strategy.run_vla_training(
         vla_dataset,
         collator,
-        action_tokenizer,
+        action_tokenizer,  # May be None if using motion_tokenizer
         metrics,
         save_interval=cfg.save_interval,
     )

@@ -1,0 +1,14 @@
+torchrun --standalone --nnodes 1 --nproc-per-node 8 vla-scripts/train.py \
+  --pretrained_checkpoint /grp01/ids_xh/zhekai/ckpt/openvla-7b-prismatic/checkpoints/step-295000-epoch-40-loss=0.2200.pt \
+  --vla.type prism-dinosiglip-224px+mx-bridge \
+  --data_root_dir /grp01/ids_xh/zhekai/data/embodied/ \
+  --run_root_dir runs \
+  --run_id attempt_1_base \
+  --image_aug True \
+  --wandb_project moto_openvla \
+  --wandb_entity azily \
+  --save_interval 2500 \
+  --is_resume False \
+  --use_motion_token True \
+  --latent_motion_tokenizer_path /grp01/ids_xh/zhekai/ckpt/moto_oxe_tokenizer \
+  --future_observation_k 3

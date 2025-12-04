@@ -11,12 +11,13 @@ from typing import Dict
 import tensorflow as tf
 
 
-def chunk_act_obs(traj: Dict, window_size: int, future_action_window_size: int = 0) -> Dict:
+def chunk_act_obs(traj: Dict, window_size: int, future_action_window_size: int = 0, future_observation_window_size: int = 0) -> Dict:
     """
     Chunks actions and observations into the given window_size.
 
-    "observation" keys are given a new axis (at index 1) of size `window_size` containing `window_size - 1`
-    observations from the past and the current observation. "action" is given a new axis (at index 1) of size
+    "observation" keys are given a new axis (at index 1) of size `window_size + future_observation_window_size` 
+    containing `window_size - 1` observations from the past, the current observation, and `future_observation_window_size` 
+    observations from the future. "action" is given a new axis (at index 1) of size
     `window_size + future_action_window_size` containing `window_size - 1` actions from the past, the current
     action, and `future_action_window_size` actions from the future. "pad_mask" is added to "observation" and
     indicates whether an observation should be considered padding (i.e. if it had come from a timestep
@@ -24,8 +25,14 @@ def chunk_act_obs(traj: Dict, window_size: int, future_action_window_size: int =
     """
     traj_len = tf.shape(traj["action"])[0]
     action_dim = traj["action"].shape[-1]
-    chunk_indices = tf.broadcast_to(tf.range(-window_size + 1, 1), [traj_len, window_size]) + tf.broadcast_to(
-        tf.range(traj_len)[:, None], [traj_len, window_size]
+    
+    # Observation chunking: includes past frames (window_size) and future frames (future_observation_window_size)
+    obs_chunk_indices = tf.broadcast_to(
+        tf.range(-window_size + 1, 1 + future_observation_window_size),
+        [traj_len, window_size + future_observation_window_size],
+    ) + tf.broadcast_to(
+        tf.range(traj_len)[:, None],
+        [traj_len, window_size + future_observation_window_size],
     )
 
     action_chunk_indices = tf.broadcast_to(
@@ -36,20 +43,20 @@ def chunk_act_obs(traj: Dict, window_size: int, future_action_window_size: int =
         [traj_len, window_size + future_action_window_size],
     )
 
-    floored_chunk_indices = tf.maximum(chunk_indices, 0)
-
     if "timestep" in traj["task"]:
         goal_timestep = traj["task"]["timestep"]
     else:
         goal_timestep = tf.fill([traj_len], traj_len - 1)
 
+    # For observations: floor negative indices (past padding), cap at trajectory end (future padding)
+    floored_obs_chunk_indices = tf.minimum(tf.maximum(obs_chunk_indices, 0), traj_len - 1)
     floored_action_chunk_indices = tf.minimum(tf.maximum(action_chunk_indices, 0), goal_timestep[:, None])
 
-    traj["observation"] = tf.nest.map_structure(lambda x: tf.gather(x, floored_chunk_indices), traj["observation"])
+    traj["observation"] = tf.nest.map_structure(lambda x: tf.gather(x, floored_obs_chunk_indices), traj["observation"])
     traj["action"] = tf.gather(traj["action"], floored_action_chunk_indices)
 
-    # indicates whether an entire observation is padding
-    traj["observation"]["pad_mask"] = chunk_indices >= 0
+    # indicates whether an entire observation is padding (past padding: indices < 0, future padding: indices >= traj_len)
+    traj["observation"]["pad_mask"] = (obs_chunk_indices >= 0) & (obs_chunk_indices < traj_len)
 
     # if no absolute_action_mask was provided, assume all actions are relative
     if "absolute_action_mask" not in traj and future_action_window_size > 0:

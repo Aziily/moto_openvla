@@ -259,6 +259,7 @@ def apply_trajectory_transforms(
     goal_relabeling_kwargs: dict = {},
     window_size: int = 1,
     future_action_window_size: int = 0,
+    future_observation_window_size: int = 0,
     subsample_length: Optional[int] = None,
     skip_unlabeled: bool = False,
     max_action: Optional[float] = None,
@@ -285,6 +286,8 @@ def apply_trajectory_transforms(
         window_size (int, optional): The length of the snippets that trajectories are chunked into.
         future_action_window_size (int, optional): The number of future actions beyond window_size to include
             in the chunked actions.
+        future_observation_window_size (int, optional): The number of future observations beyond window_size to include
+            in the chunked observations.
         subsample_length (int, optional): If provided, trajectories longer than this will be subsampled to
             this length (after goal relabeling and chunking).
         skip_unlabeled (bool, optional): Whether to skip trajectories with no language labels.
@@ -331,13 +334,14 @@ def apply_trajectory_transforms(
             num_parallel_calls,
         )
 
-    # chunks observations and actions, giving them a new axis at index 1 of size `window_size` and
+    # chunks observations and actions, giving them a new axis at index 1 of size `window_size + future_observation_window_size` and
     # `window_size + future_action_window_size`, respectively
     dataset = dataset.traj_map(
         partial(
             traj_transforms.chunk_act_obs,
             window_size=window_size,
             future_action_window_size=future_action_window_size,
+            future_observation_window_size=future_observation_window_size,
         ),
         num_parallel_calls,
     )

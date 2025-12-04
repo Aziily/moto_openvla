@@ -44,6 +44,7 @@ from prismatic.util.data_utils import PaddedCollatorForActionPrediction
 from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
+from prismatic.vla.materialize import get_vla_dataset_and_collator
 
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
@@ -107,6 +108,11 @@ class FinetuneConfig:
     wandb_entity: str = "stanford-voltron"                          # Name of entity to log under
     run_id_note: Optional[str] = None                               # Extra note for logging, Weights & Biases
 
+    # Motion Token Parameters
+    use_motion_token: bool = False                                  # Whether to use motion tokenizer instead of action tokenizer
+    latent_motion_tokenizer_path: Optional[Path] = None             # Path to latent motion tokenizer checkpoint directory
+    future_observation_k: int = 3                                   # k-steps into the future for motion token extraction
+
     # fmt: on
 
 
@@ -134,6 +140,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         exp_id += f"--{cfg.run_id_note}"
     if cfg.image_aug:
         exp_id += "--image_aug"
+    if cfg.use_motion_token:
+        exp_id += f"--motion_token+k{cfg.future_observation_k}"
 
     # Start =>> Build Directories
     run_dir, adapter_dir = cfg.run_root_dir / exp_id, cfg.adapter_tmp_dir / exp_id
@@ -192,43 +200,32 @@ def finetune(cfg: FinetuneConfig) -> None:
     action_tokenizer = ActionTokenizer(processor.tokenizer)
 
     # Load Fine-tuning Dataset =>> note that we use an RLDS-formatted dataset following Open X-Embodiment by default.
-    #   =>> If you want to use a non-RLDS dataset (e.g., a standard PyTorch Dataset) see the following commented block.
-    #   =>> Note that our training code does not loop over epochs because the RLDS loader does this implicitly; if using
-    #       your own Dataset, make sure to add the appropriate logic to the training loop!
-    #
-    # ---
-    # from prismatic.vla.datasets import DummyDataset
-    #
-    # vla_dataset = DummyDataset(
-    #     action_tokenizer,
-    #     processor.tokenizer,
-    #     image_transform=processor.image_processor.apply_transform,
-    #     prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
-    # )
-    # ---
-    batch_transform = RLDSBatchTransform(
-        action_tokenizer,
-        processor.tokenizer,
+    #   If `use_motion_token=True`, this will instead use the motion tokenizer and motion tokens.
+    vla_dataset, action_tokenizer, motion_tokenizer, collator = get_vla_dataset_and_collator(
+        data_root_dir=cfg.data_root_dir,
+        data_mix=cfg.dataset_name,
         image_transform=processor.image_processor.apply_transform,
+        tokenizer=processor.tokenizer,
         prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
-    )
-    vla_dataset = RLDSDataset(
-        cfg.data_root_dir,
-        cfg.dataset_name,
-        batch_transform,
-        resize_resolution=tuple(vla.module.config.image_sizes),
+        default_image_resolution=tuple(vla.module.config.image_sizes),
+        padding_side="right",
         shuffle_buffer_size=cfg.shuffle_buffer_size,
+        train=True,
+        episodic=False,
         image_aug=cfg.image_aug,
+        use_motion_token=cfg.use_motion_token,
+        latent_motion_tokenizer_path=str(cfg.latent_motion_tokenizer_path)
+        if cfg.latent_motion_tokenizer_path is not None
+        else None,
+        window_size=1,
+        future_observation_k=cfg.future_observation_k if cfg.use_motion_token else 0,
     )
 
-    # [Important] Save Dataset Statistics =>> used to de-normalize actions for inference!
-    if distributed_state.is_main_process:
+    # [Important] Save Dataset Statistics =>> used to de-normalize actions / motions for inference!
+    if distributed_state.is_main_process and hasattr(vla_dataset, "dataset_statistics"):
         save_dataset_statistics(vla_dataset.dataset_statistics, run_dir)
 
-    # Create Collator and DataLoader
-    collator = PaddedCollatorForActionPrediction(
-        processor.tokenizer.model_max_length, processor.tokenizer.pad_token_id, padding_side="right"
-    )
+    # Create DataLoader
     dataloader = DataLoader(
         vla_dataset,
         batch_size=cfg.batch_size,
@@ -246,8 +243,11 @@ def finetune(cfg: FinetuneConfig) -> None:
     recent_action_accuracies = deque(maxlen=cfg.grad_accumulation_steps)
     recent_l1_losses = deque(maxlen=cfg.grad_accumulation_steps)
 
+    # Whether we can compute action-level metrics (only when using action tokens)
+    has_action_metrics = action_tokenizer is not None
+
     # Train!
-    with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
+    with tqdm.tqdm(total=cfg.max_steps, leave=False, desc="训练中...") as progress:
         vla.train()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
@@ -266,29 +266,34 @@ def finetune(cfg: FinetuneConfig) -> None:
             # Backward pass
             normalized_loss.backward()
 
-            # Compute Accuracy and L1 Loss for Logging
-            action_logits = output.logits[:, vla.module.vision_backbone.featurizer.patch_embed.num_patches : -1]
-            action_preds = action_logits.argmax(dim=2)
-            action_gt = batch["labels"][:, 1:].to(action_preds.device)
-            mask = action_gt > action_tokenizer.action_token_begin_idx
+            # Optionally compute Accuracy and L1 Loss for Logging (only for action tokens)
+            if has_action_metrics:
+                action_logits = output.logits[
+                    :, vla.module.vision_backbone.featurizer.patch_embed.num_patches : -1
+                ]
+                action_preds = action_logits.argmax(dim=2)
+                action_gt = batch["labels"][:, 1:].to(action_preds.device)
+                mask = action_gt > action_tokenizer.action_token_begin_idx
 
-            # Compute Accuracy
-            correct_preds = (action_preds == action_gt) & mask
-            action_accuracy = correct_preds.sum().float() / mask.sum().float()
+                # Compute Accuracy
+                correct_preds = (action_preds == action_gt) & mask
+                action_accuracy = correct_preds.sum().float() / mask.sum().float()
 
-            # Compute L1 Loss on Predicted (Continuous) Actions
-            continuous_actions_pred = torch.tensor(
-                action_tokenizer.decode_token_ids_to_actions(action_preds[mask].cpu().numpy())
-            )
-            continuous_actions_gt = torch.tensor(
-                action_tokenizer.decode_token_ids_to_actions(action_gt[mask].cpu().numpy())
-            )
-            action_l1_loss = torch.nn.functional.l1_loss(continuous_actions_pred, continuous_actions_gt)
+                # Compute L1 Loss on Predicted (Continuous) Actions
+                continuous_actions_pred = torch.tensor(
+                    action_tokenizer.decode_token_ids_to_actions(action_preds[mask].cpu().numpy())
+                )
+                continuous_actions_gt = torch.tensor(
+                    action_tokenizer.decode_token_ids_to_actions(action_gt[mask].cpu().numpy())
+                )
+                action_l1_loss = torch.nn.functional.l1_loss(continuous_actions_pred, continuous_actions_gt)
 
-            # Store recent train metrics
+                # Store recent train metrics
+                recent_action_accuracies.append(action_accuracy.item())
+                recent_l1_losses.append(action_l1_loss.item())
+
+            # Store recent train loss
             recent_losses.append(loss.item())
-            recent_action_accuracies.append(action_accuracy.item())
-            recent_l1_losses.append(action_l1_loss.item())
 
             # Compute gradient step index
             gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
@@ -297,25 +302,41 @@ def finetune(cfg: FinetuneConfig) -> None:
             #   =>> Equal to current step metrics when not using gradient accumulation
             #   =>> Otherwise, equal to the average of metrics observed over micro-batches used for gradient accumulation
             smoothened_loss = sum(recent_losses) / len(recent_losses)
-            smoothened_action_accuracy = sum(recent_action_accuracies) / len(recent_action_accuracies)
-            smoothened_l1_loss = sum(recent_l1_losses) / len(recent_l1_losses)
+            smoothened_action_accuracy = (
+                sum(recent_action_accuracies) / len(recent_action_accuracies)
+                if has_action_metrics and len(recent_action_accuracies) > 0
+                else None
+            )
+            smoothened_l1_loss = (
+                sum(recent_l1_losses) / len(recent_l1_losses)
+                if has_action_metrics and len(recent_l1_losses) > 0
+                else None
+            )
 
             # Push Metrics to W&B (every 10 gradient steps)
             if distributed_state.is_main_process and gradient_step_idx % 10 == 0:
-                wandb.log(
-                    {
-                        "train_loss": smoothened_loss,
-                        "action_accuracy": smoothened_action_accuracy,
-                        "l1_loss": smoothened_l1_loss,
-                    },
-                    step=gradient_step_idx,
-                )
+                log_dict = {"train_loss": smoothened_loss}
+                if smoothened_action_accuracy is not None:
+                    log_dict["action_accuracy"] = smoothened_action_accuracy
+                if smoothened_l1_loss is not None:
+                    log_dict["l1_loss"] = smoothened_l1_loss
+                wandb.log(log_dict, step=gradient_step_idx)
 
             # Optimizer Step
             if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
                 optimizer.step()
                 optimizer.zero_grad()
                 progress.update()
+                
+                # Update progress bar with loss information using smoothened metrics
+                if has_action_metrics and smoothened_action_accuracy is not None and smoothened_l1_loss is not None:
+                    progress.set_description(
+                        f"Step {gradient_step_idx}/{cfg.max_steps} | Loss: {smoothened_loss:.4f} | L1: {smoothened_l1_loss:.4f} | Acc: {smoothened_action_accuracy:.4f}"
+                    )
+                else:
+                    progress.set_description(
+                        f"Step {gradient_step_idx}/{cfg.max_steps} | Loss: {smoothened_loss:.4f}"
+                    )
 
             # Save Model Checkpoint =>> by default, only keeps the latest checkpoint, continually overwriting it!
             if gradient_step_idx > 0 and gradient_step_idx % cfg.save_steps == 0:

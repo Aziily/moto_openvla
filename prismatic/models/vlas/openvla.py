@@ -15,6 +15,7 @@ from transformers import LlamaTokenizerFast
 from prismatic.models.vlms.prismatic import PrismaticVLM
 from prismatic.overwatch import initialize_overwatch
 from prismatic.vla.action_tokenizer import ActionTokenizer
+from prismatic.vla.motion_tokenizer import MotionTokenizer
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
@@ -24,13 +25,23 @@ class OpenVLA(PrismaticVLM):
     def __init__(
         self,
         *args,
-        norm_stats: Dict[str, Dict[str, Dict[str, Dict[str, List[float]]]]],
-        action_tokenizer: ActionTokenizer,
+        norm_stats: Dict[str, Dict[str, Dict[str, Dict[str, List[float]]]]] = None,
+        action_tokenizer: ActionTokenizer = None,
+        motion_tokenizer: MotionTokenizer = None,
+        use_motion_token: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.norm_stats = norm_stats
         self.action_tokenizer = action_tokenizer
+        self.motion_tokenizer = motion_tokenizer
+        self.use_motion_token = use_motion_token
+        
+        # Validate that at least one tokenizer is provided
+        if not use_motion_token and action_tokenizer is None:
+            raise ValueError("Either action_tokenizer or motion_tokenizer must be provided")
+        if use_motion_token and motion_tokenizer is None:
+            raise ValueError("motion_tokenizer must be provided when use_motion_token=True")
 
     @torch.inference_mode()
     def predict_action(
@@ -119,10 +130,14 @@ class OpenVLA(PrismaticVLM):
         return unnorm_key
 
     def get_action_dim(self, unnorm_key: Optional[str] = None) -> int:
-        """Dimensionality of the policy's action space."""
-        unnorm_key = self._check_unnorm_key(self.norm_stats, unnorm_key)
-
-        return len(self.norm_stats[unnorm_key]["action"]["q01"])
+        """Dimensionality of the policy's output space (action tokens or motion tokens)."""
+        if self.use_motion_token and self.motion_tokenizer is not None:
+            # Return number of motion query tokens
+            return self.motion_tokenizer.motion_query_num
+        else:
+            # Return action dimension
+            unnorm_key = self._check_unnorm_key(self.norm_stats, unnorm_key)
+            return len(self.norm_stats[unnorm_key]["action"]["q01"])
 
     def get_action_stats(self, unnorm_key: Optional[str] = None) -> Dict:
         """Dimensionality of the policy's action space."""

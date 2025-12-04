@@ -257,13 +257,23 @@ class VLAMetrics:
         for tracker in self.trackers:
             tracker.write(global_step, metrics)
 
-    def get_status(self, loss: Optional[torch.Tensor] = None) -> str:
+    def get_status(
+        self, 
+        loss: Optional[torch.Tensor] = None, 
+        l1_loss: Optional[float] = None, 
+        action_accuracy: Optional[float] = None
+    ) -> str:
         lr = self.state["lr"][-1] if len(self.state["lr"]) > 0 else 0
         if loss is None:
             return f"=>> [Epoch {self.epoch:03d}] Global Step {self.global_step:06d} =>> LR :: {lr:.6f}"
 
-        # Otherwise, embed `loss` in status report!
-        return f"=>> [Epoch {self.epoch:03d}] Global Step {self.global_step:06d} =>> LR :: {lr:.6f} - Loss :: {loss:.4f}"
+        # Build status string with loss and optional metrics
+        status = f"=>> [Epoch {self.epoch:03d}] Global Step {self.global_step:06d} =>> LR :: {lr:.6f} - Loss :: {loss:.4f}"
+        if l1_loss is not None:
+            status += f" | L1: {l1_loss:.4f}"
+        if action_accuracy is not None:
+            status += f" | Acc: {action_accuracy:.4f}"
+        return status
 
     def commit(
         self,
@@ -310,10 +320,10 @@ class VLAMetrics:
         # Note :: Raw Loss is an Average over Gradient Accumulation Steps --> No Smoothing!
         loss_raw = torch.stack(list(self.state["loss_raw"])).mean().item()
         loss = torch.stack(list(self.state["loss"])).mean().item()
-        l1_loss = torch.stack(list(self.state["l1_loss"])).mean().item()
-        action_accuracy = torch.stack(list(self.state["action_accuracy"])).mean().item()
+        l1_loss = torch.stack(list(self.state["l1_loss"])).mean().item() if len(self.state["l1_loss"]) > 0 else None
+        action_accuracy = torch.stack(list(self.state["action_accuracy"])).mean().item() if len(self.state["action_accuracy"]) > 0 else None
         step_time, lr = np.mean(list(self.state["step_time"])), self.state["lr"][-1]
-        status = self.get_status(loss)
+        status = self.get_status(loss, l1_loss, action_accuracy)
 
         # Get metrics per dataset
         dataset_metrics = {}
@@ -327,20 +337,21 @@ class VLAMetrics:
 
         # Fire to Trackers
         prefix = "VLA Train"
-        self.log(
-            self.global_step,
-            metrics={
-                f"{prefix}/Step": self.global_step,
-                f"{prefix}/Epoch": self.epoch,
-                f"{prefix}/Loss": loss,
-                f"{prefix}/L1 Loss": l1_loss,
-                f"{prefix}/Action Token Accuracy": action_accuracy,
-                f"{prefix}/Loss (Raw)": loss_raw,
-                f"{prefix}/Learning Rate": lr,
-                f"{prefix}/Step Time": step_time,
-                **dataset_metrics,
-            },
-        )
+        log_metrics = {
+            f"{prefix}/Step": self.global_step,
+            f"{prefix}/Epoch": self.epoch,
+            f"{prefix}/Loss": loss,
+            f"{prefix}/Loss (Raw)": loss_raw,
+            f"{prefix}/Learning Rate": lr,
+            f"{prefix}/Step Time": step_time,
+        }
+        # Only add optional metrics if they are available
+        if l1_loss is not None:
+            log_metrics[f"{prefix}/L1 Loss"] = l1_loss
+        if action_accuracy is not None:
+            log_metrics[f"{prefix}/Action Token Accuracy"] = action_accuracy
+        log_metrics.update(dataset_metrics)
+        self.log(self.global_step, metrics=log_metrics)
         return status
 
     def finalize(self) -> str:
